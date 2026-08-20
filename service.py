@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import traceback
+from base64 import b64encode
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import date
 from threading import Event
-from typing import Callable
+from urllib.parse import quote
 
 from config import Settings
 from exporter import Exporter
@@ -13,10 +18,42 @@ from ollama_client import AiDecision, OllamaClient
 from rules import RuleEngine
 from storage import Storage, utcnow_text
 
-
 LogCallback = Callable[[str], None]
 ResultCallback = Callable[[dict], None]
 ProgressCallback = Callable[[int, int], None]
+
+
+def _attachments_text(parsed: ParsedMail) -> str:
+    if not parsed.attachments:
+        return ""
+    parts = []
+    for att in parsed.attachments:
+        name = att.get("filename", "")
+        size = att.get("size", 0)
+        if size:
+            parts.append(f"{name}({size}B)")
+        else:
+            parts.append(name)
+    return "; ".join(p for p in parts if p)
+
+
+def recipient_allowed(parsed: ParsedMail, settings: Settings) -> bool:
+    """按监听源过滤：判断该邮件是否属于关注范围。"""
+    mode = (getattr(settings, "recipient_filter", "off") or "off").lower()
+    if mode in ("", "off"):
+        return True
+    recipients = set(parsed.to_addresses) | set(parsed.cc_addresses)
+    if mode == "to_or_cc_me":
+        me = (settings.imap_username or "").strip().lower()
+        if not me:
+            return True
+        return me in recipients
+    if mode == "watched":
+        watched = {a.strip().lower() for a in getattr(settings, "watched_addresses", []) if a.strip()}
+        if not watched:
+            return True
+        return bool(recipients & watched)
+    return True
 
 
 class MonitorService:
@@ -38,14 +75,55 @@ class MonitorService:
         self.progress_callback = progress_callback
 
     def log(self, message: str, level: str = "INFO") -> None:
-        safe_message = message.replace(self.settings.imap_password, "***") if self.settings.imap_password else message
+        safe_message = self._redact(message)
         self.storage.append_log(level, safe_message)
         if self.log_callback:
             self.log_callback(safe_message)
 
+    def _redact(self, message: str) -> str:
+        safe = message
+        secrets = [self.settings.imap_password]
+        for secret in secrets:
+            if not secret:
+                continue
+            safe = safe.replace(secret, "***")
+            with suppress(Exception):
+                safe = safe.replace(quote(secret), "***")
+            with suppress(Exception):
+                safe = safe.replace(b64encode(secret.encode()).decode(), "***")
+        return safe
+
     def notify_result(self, row: dict) -> None:
         if self.result_callback:
             self.result_callback(row)
+
+    def _maybe_desktop_notify(self, record: dict) -> None:
+        if record.get("importance") != "high":
+            return
+        if not getattr(self.settings, "desktop_notify", True):
+            return
+        title = "高优先邮件"
+        summary = record.get("summary") or record.get("subject") or ""
+        sender = record.get("sender", "")
+        message = f"{sender}: {summary}"[:200]
+        with suppress(Exception):
+            self._send_desktop_notification(title, message)
+
+    def _send_desktop_notification(self, title: str, message: str) -> None:
+        try:
+            from plyer import notification  # type: ignore
+
+            notification.notify(title=title, message=message, timeout=10)
+            return
+        except Exception:
+            pass
+        import sys
+
+        if sys.platform.startswith("win"):
+            with suppress(Exception):
+                import ctypes
+
+                ctypes.windll.user32.MessageBeep(0)
 
     def notify_progress(self, current: int, total: int) -> None:
         if self.progress_callback:
@@ -119,13 +197,18 @@ class MonitorService:
                 return
             raw_bytes = watcher.fetch_message(uid)
             parsed = parse_email_bytes(raw_bytes, uid, preview_len=self.settings.body_preview_len)
+            if not recipient_allowed(parsed, self.settings):
+                self.storage.update_last_seen_uid(self.settings.mailbox_key, uidvalidity, uid)
+                self.storage.finish_job(job["id"])
+                self.log(f"邮件 UID={uid} 不在监听源范围内，已跳过（未调用 AI）。")
+                return
             duplicate_reason = self._detect_duplicate(parsed)
             if duplicate_reason:
                 record = self._build_duplicate_record(parsed, uidvalidity, duplicate_reason)
                 self.storage.save_mail(record)
                 self.storage.update_last_seen_uid(self.settings.mailbox_key, uidvalidity, uid)
                 self.storage.finish_job(job["id"])
-                self.exporter.sync_default_outputs()
+                self.exporter.append_default_outputs(record)
                 self.notify_result(record)
                 self.log(f"邮件 UID={uid} 因 {duplicate_reason} 被去重。")
                 return
@@ -147,6 +230,9 @@ class MonitorService:
                 "rule_hit": decision["rule_hit"],
                 "summary": decision["summary"],
                 "body_preview": parsed.body_preview,
+                "attachments": _attachments_text(parsed),
+                "categories": decision.get("categories", ""),
+                "action_items": decision.get("action_items", ""),
                 "status": "done",
                 "error": "",
                 "processed_at": utcnow_text(),
@@ -154,8 +240,9 @@ class MonitorService:
             self.storage.save_mail(record)
             self.storage.update_last_seen_uid(self.settings.mailbox_key, uidvalidity, uid)
             self.storage.finish_job(job["id"])
-            self.exporter.sync_default_outputs()
+            self.exporter.append_default_outputs(record)
             self.notify_result(record)
+            self._maybe_desktop_notify(record)
             self.log(f"邮件 UID={uid} 处理完成：{record['category']} / {record['importance']}")
         except Exception as exc:  # pragma: no cover - integration path
             message = f"{type(exc).__name__}: {exc}"
@@ -185,7 +272,7 @@ class MonitorService:
                 }
                 self.storage.save_mail(record)
                 self.storage.fail_job(job["id"], message)
-                self.exporter.sync_default_outputs()
+                self.exporter.append_default_outputs(record)
                 self.notify_result(record)
                 self.log(f"邮件 UID={uid} 最终失败：{message}", level="ERROR")
                 self.log(traceback.format_exc(limit=3), level="ERROR")
@@ -197,16 +284,42 @@ class MonitorService:
             return "3秒主题窗口去重"
         return ""
 
+    def _content_hash(self, parsed: ParsedMail) -> str:
+        raw = f"{parsed.sender_address}\n{parsed.subject}\n{parsed.body_text}".encode()
+        return hashlib.sha256(raw).hexdigest()
+
     def _analyze_mail(self, parsed: ParsedMail) -> dict[str, str]:
         rule = self.rule_engine.evaluate(parsed)
+        content_hash = self._content_hash(parsed)
+        cached = None
+        if getattr(self.settings, "ai_cache_enabled", True):
+            cached = self.storage.get_ai_cache(content_hash)
+        if cached:
+            self.log(f"命中 AI 缓存（内容哈希 {content_hash[:8]}），跳过 LLM 调用。")
+            importance = rule.forced_importance or cached.get("importance", "normal")
+            return {
+                "category": cached.get("category", "其他"),
+                "summary": cached.get("summary", ""),
+                "importance": importance,
+                "rule_hit": rule.matched_rule,
+                "categories": cached.get("categories", ""),
+                "action_items": cached.get("action_items", ""),
+            }
         ai: AiDecision = self.ollama.analyze(parsed)
         importance = rule.forced_importance or ai.importance
-        return {
+        categories = ai.categories or ([ai.category] if ai.category else [])
+        result = {
             "category": ai.category,
             "summary": ai.summary,
             "importance": importance,
             "rule_hit": rule.matched_rule,
+            "categories": "、".join(categories),
+            "action_items": json.dumps(ai.action_items, ensure_ascii=False) if ai.action_items else "",
         }
+        if getattr(self.settings, "ai_cache_enabled", True):
+            with suppress(Exception):
+                self.storage.put_ai_cache(content_hash, {**result, "importance": ai.importance})
+        return result
 
     def _build_duplicate_record(self, parsed: ParsedMail, uidvalidity: str, duplicate_reason: str) -> dict:
         return {
@@ -225,6 +338,9 @@ class MonitorService:
             "rule_hit": duplicate_reason,
             "summary": "重复邮件，已跳过。",
             "body_preview": parsed.body_preview,
+            "attachments": _attachments_text(parsed),
+            "categories": "",
+            "action_items": "",
             "status": "duplicate",
             "error": "",
             "processed_at": utcnow_text(),

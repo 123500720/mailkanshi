@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import imaplib
 import sys
-import threading
-import traceback
 from copy import deepcopy
 from datetime import date, timedelta
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -14,11 +11,12 @@ import requests
 from config import Settings, load_settings
 from diagnostics import humanize_error
 from exporter import Exporter
-from service import MonitorService
+from qt_theme import APP_QSS, STATE_META
+from qt_worker import ServiceThread
 from storage import Storage
 
 try:
-    from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer
+    from PySide6.QtCore import QDate, Qt, QTimer
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (
         QApplication,
@@ -54,32 +52,6 @@ try:
 except ImportError as exc:
     raise RuntimeError("缺少 PySide6。请运行：pip install PySide6") from exc
 
-APP_QSS = """
-QMainWindow,QWidget{background:#0f172a;color:#e5e7eb;font-family:'Microsoft YaHei UI','Segoe UI';font-size:13px}
-QFrame#Sidebar{background:#0b1120;border-right:1px solid #1e293b} QLabel#AppTitle{font-size:20px;font-weight:800;color:#f8fafc}
-QLabel#HeroTitle{font-size:24px;font-weight:800;color:#f8fafc} QLabel#Muted{color:#94a3b8}
-QPushButton{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:9px 13px;color:#e5e7eb} QPushButton:hover{background:#334155} QPushButton:disabled{background:#111827;color:#64748b;border-color:#1f2937}
-QPushButton#PrimaryButton{background:#2563eb;border-color:#3b82f6;color:white;font-weight:700} QPushButton#PrimaryButton:hover{background:#1d4ed8}
-QPushButton#DangerButton{background:#7f1d1d;border-color:#991b1b;color:#fee2e2;font-weight:700}
-QPushButton#NavButton{text-align:left;border:0;border-radius:12px;padding:11px 14px;color:#cbd5e1;background:transparent} QPushButton#NavButton:checked{background:#1d4ed8;color:white;font-weight:700}
-QFrame#TopBar,QFrame#Card,QGroupBox{background:#111c33;border:1px solid #243044;border-radius:16px} QGroupBox{margin-top:12px;padding:16px 12px 12px 12px;font-weight:700}
-QGroupBox::title{subcontrol-origin:margin;left:14px;padding:0 6px;color:#bfdbfe}
-QLineEdit,QComboBox,QDateEdit,QPlainTextEdit,QTextEdit{background:#0b1220;border:1px solid #334155;border-radius:10px;padding:8px;color:#f8fafc;selection-background-color:#2563eb}
-QLineEdit[invalid="true"],QComboBox[invalid="true"],QDateEdit[invalid="true"],QPlainTextEdit[invalid="true"]{border:1px solid #ef4444;background:#1f1118}
-QTableWidget{background:#0b1220;gridline-color:#1e293b;border:1px solid #243044;border-radius:12px;selection-background-color:#1d4ed8;alternate-background-color:#101a2e}
-QHeaderView::section{background:#111c33;color:#cbd5e1;padding:8px;border:0;border-right:1px solid #243044;font-weight:700}
-QListWidget{background:#0b1220;border:1px solid #243044;border-radius:12px;padding:6px} QListWidget::item{padding:10px;border-radius:10px} QListWidget::item:selected{background:#1d4ed8}
-QProgressBar{background:#0b1220;border:1px solid #334155;border-radius:8px;height:12px;text-align:center} QProgressBar::chunk{background:#22c55e;border-radius:7px}
-"""
-
-STATE_META = {
-    "idle": ("待命", "#64748b"),
-    "watching": ("监控中", "#22c55e"),
-    "collecting": ("处理中", "#eab308"),
-    "stopping": ("停止中", "#f97316"),
-    "error": ("异常", "#ef4444"),
-}
-
 
 class UserFacingError(ValueError):
     def __init__(self, message: str, widget: QWidget | None = None, page_index: int | None = None) -> None:
@@ -87,55 +59,6 @@ class UserFacingError(ValueError):
         self.widget = widget
         self.page_index = page_index
 
-
-class ServiceThread(QThread):
-    log_signal = Signal(str)
-    result_signal = Signal(dict)
-    progress_signal = Signal(int, int)
-    status_signal = Signal(str)
-    error_signal = Signal(str)
-    models_signal = Signal(list)
-
-    def __init__(self, settings: Settings, storage: Storage, mode: str, start_date: date | None = None, end_date: date | None = None) -> None:
-        super().__init__()
-        self.settings = settings
-        self.storage = storage
-        self.mode = mode
-        self.start_date = start_date
-        self.end_date = end_date
-        self.stop_event = threading.Event()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def run(self) -> None:
-        try:
-            svc = MonitorService(
-                self.settings,
-                storage=self.storage,
-                log_callback=lambda msg: self.log_signal.emit("INFO | " + msg),
-                result_callback=self.result_signal.emit,
-                progress_callback=self.progress_signal.emit,
-            )
-            if self.mode == "watch":
-                self.status_signal.emit("常驻监控运行中")
-                svc.watch(self.stop_event)
-                self.status_signal.emit("常驻监控已停止")
-            elif self.mode == "collect":
-                if not self.start_date or not self.end_date:
-                    raise ValueError("收集模式缺少日期范围")
-                self.status_signal.emit(f"正在收集 {self.start_date} ~ {self.end_date}")
-                svc.collect(self.start_date, self.end_date, self.stop_event)
-                self.status_signal.emit("一键收集完成")
-            elif self.mode == "models":
-                self.status_signal.emit("正在读取本地 Ollama 模型")
-                self.models_signal.emit(svc.list_models())
-                self.status_signal.emit("本地 Ollama 连接正常")
-            else:
-                raise ValueError(f"未知任务：{self.mode}")
-        except Exception as exc:
-            self.error_signal.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}")
-            self.status_signal.emit("任务异常，请查看日志")
 
 class FirstRunDialog(QDialog):
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
@@ -170,9 +93,18 @@ class FirstRunDialog(QDialog):
         ai_box = QGroupBox("3. 本地 Ollama")
         ai_form = QFormLayout(ai_box)
         self.ollama_edit = QLineEdit(settings.ollama_base_url)
-        self.model_edit = QLineEdit(settings.ollama_model)
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        if settings.ollama_model:
+            self.model_combo.addItem(settings.ollama_model)
+        self.model_combo.setEditText(settings.ollama_model)
+        refresh_model_btn = QPushButton("刷新模型")
+        refresh_model_btn.clicked.connect(self._load_models)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.model_combo, 1)
+        model_row.addWidget(refresh_model_btn)
         ai_form.addRow("Ollama 地址", self.ollama_edit)
-        ai_form.addRow("模型", self.model_edit)
+        ai_form.addRow("模型", model_row)
         layout.addWidget(ai_box)
 
         test_row = QHBoxLayout()
@@ -207,7 +139,7 @@ class FirstRunDialog(QDialog):
             "password": self.password_edit.text().strip(),
             "folder": self.folder_edit.text().strip() or "INBOX",
             "ollama_url": self.ollama_edit.text().strip() or "http://localhost:11434",
-            "model": self.model_edit.text().strip(),
+            "model": self.model_combo.currentText().strip(),
             "autostart": self.autostart_check.isChecked(),
         }
 
@@ -231,9 +163,35 @@ class FirstRunDialog(QDialog):
     def test_ollama(self) -> None:
         try:
             values = self.values()
-            response = requests.get(str(values["ollama_url"]).rstrip("/") + "/api/tags", timeout=8)
+            url = str(values["ollama_url"]).rstrip("/")
+            proxies = None
+            if any(h in url for h in ("localhost", "127.0.0.1", "::1")):
+                proxies = {"http": None, "https": None}
+            response = requests.get(url + "/api/tags", timeout=8, proxies=proxies)
             response.raise_for_status()
             self.ollama_result.setText("Ollama 测试成功")
+            self.ollama_result.setStyleSheet("color:#22c55e")
+        except Exception as exc:
+            msg = humanize_error(f"Ollama {type(exc).__name__}: {exc}")
+            self.ollama_result.setText(msg)
+            self.ollama_result.setStyleSheet("color:#ef4444")
+
+    def _load_models(self) -> None:
+        try:
+            values = self.values()
+            url = str(values["ollama_url"]).rstrip("/")
+            proxies = None
+            if any(h in url for h in ("localhost", "127.0.0.1", "::1")):
+                proxies = {"http": None, "https": None}
+            response = requests.get(url + "/api/tags", timeout=8, proxies=proxies)
+            response.raise_for_status()
+            models = [m["name"] for m in response.json().get("models", []) if m.get("name")]
+            current = self.model_combo.currentText().strip()
+            self.model_combo.clear()
+            self.model_combo.addItems(models or ([current] if current else []))
+            if current:
+                self.model_combo.setEditText(current)
+            self.ollama_result.setText(f"已载入 {len(models)} 个模型")
             self.ollama_result.setStyleSheet("color:#22c55e")
         except Exception as exc:
             msg = humanize_error(f"Ollama {type(exc).__name__}: {exc}")
@@ -279,6 +237,19 @@ class MailMonitorModernWindow(QMainWindow):
         self.ssl_check = QCheckBox("SSL 连接")
         self.ssl_check.setChecked(s.imap_ssl)
         self.poll_edit = QLineEdit(str(s.poll_interval))
+        self.prefer_idle_check = QCheckBox("优先使用 IMAP IDLE 推送（降低空闲占用）")
+        self.prefer_idle_check.setChecked(s.prefer_idle)
+        self.recipient_filter_combo = QComboBox()
+        self._recipient_filter_values = ["off", "to_or_cc_me", "watched"]
+        self.recipient_filter_combo.addItems([
+            "不过滤（处理全部）",
+            "只处理发/抄给我的",
+            "只处理发/抄给指定地址的",
+        ])
+        _rf = s.recipient_filter if s.recipient_filter in self._recipient_filter_values else "off"
+        self.recipient_filter_combo.setCurrentIndex(self._recipient_filter_values.index(_rf))
+        self.watched_addresses_edit = QLineEdit(", ".join(s.watched_addresses))
+        self.watched_addresses_edit.setPlaceholderText("多个地址用逗号分隔，如 a@x.com, b@y.com")
 
         self.ollama_url_edit = QLineEdit(s.ollama_base_url)
         self.model_combo = QComboBox()
@@ -532,11 +503,22 @@ class MailMonitorModernWindow(QMainWindow):
         imap_form.addRow("文件夹", self.folder_edit)
         imap_form.addRow("SSL", self.ssl_check)
         imap_form.addRow("监控间隔秒", self.poll_edit)
+        imap_form.addRow("", self.prefer_idle_check)
+
+        filter_box = QGroupBox("监听源过滤")
+        filter_form = QFormLayout(filter_box)
+        filter_form.addRow("范围", self.recipient_filter_combo)
+        filter_form.addRow("指定地址", self.watched_addresses_edit)
 
         ai_box = QGroupBox("本地 Ollama")
         ai_form = QFormLayout(ai_box)
         ai_form.addRow("地址", self.ollama_url_edit)
-        ai_form.addRow("模型", self.model_combo)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.model_combo, 1)
+        refresh_btn = QPushButton("刷新模型")
+        refresh_btn.clicked.connect(self.refresh_models)
+        model_row.addWidget(refresh_btn)
+        ai_form.addRow("模型", model_row)
         ai_form.addRow("线程数", self.thread_edit)
         ai_form.addRow("上下文", self.ctx_edit)
         ai_form.addRow("超时秒", self.timeout_edit)
@@ -550,8 +532,9 @@ class MailMonitorModernWindow(QMainWindow):
 
         grid.addWidget(imap_box, 0, 0)
         grid.addWidget(ai_box, 0, 1)
-        grid.addWidget(storage_box, 1, 0, 1, 2)
-        grid.setRowStretch(2, 1)
+        grid.addWidget(filter_box, 1, 0, 1, 2)
+        grid.addWidget(storage_box, 2, 0, 1, 2)
+        grid.setRowStretch(3, 1)
         return page
 
     def _logs(self) -> QWidget:
@@ -634,6 +617,9 @@ class MailMonitorModernWindow(QMainWindow):
         settings.imap_folder = self.folder_edit.text().strip() or "INBOX"
         settings.imap_ssl = self.ssl_check.isChecked()
         settings.poll_interval = self._parse_int_field(self.poll_edit, "监控间隔", 10, 3)
+        settings.prefer_idle = self.prefer_idle_check.isChecked()
+        settings.recipient_filter = self._recipient_filter_values[self.recipient_filter_combo.currentIndex()]
+        settings.watched_addresses = [a.lower() for a in self._csv(self.watched_addresses_edit.text())]
         settings.ollama_base_url = self.ollama_url_edit.text().strip() or "http://localhost:11434"
         settings.ollama_model = self.model_combo.currentText().strip() or settings.ollama_model
         settings.ollama_num_thread = self._parse_int_field(self.thread_edit, "线程数", 8, 3)
@@ -684,13 +670,16 @@ class MailMonitorModernWindow(QMainWindow):
             "IMAP_SEARCH=ALL",
             f"IMAP_TIMEOUT={settings.imap_timeout}",
             f"POLL_INTERVAL={settings.poll_interval}",
-            "PREFER_IDLE=0",
+            f"PREFER_IDLE={1 if settings.prefer_idle else 0}",
+            f"RECIPIENT_FILTER={settings.recipient_filter}",
+            f"WATCHED_ADDRESSES={','.join(settings.watched_addresses)}",
             "",
             f"OLLAMA_BASE_URL={settings.ollama_base_url}",
             f"OLLAMA_MODEL={settings.ollama_model}",
             f"OLLAMA_TIMEOUT={settings.ollama_timeout}",
             f"OLLAMA_NUM_THREAD={settings.ollama_num_thread}",
             f"OLLAMA_NUM_CTX={settings.ollama_num_ctx}",
+            f"OLLAMA_KEEP_ALIVE={settings.ollama_keep_alive}",
             f"ALLOW_REMOTE_OLLAMA={1 if settings.allow_remote_ollama else 0}",
             "",
             f"AI_BODY_MAX_LEN={settings.ai_body_max_len}",

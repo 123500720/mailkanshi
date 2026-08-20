@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import imaplib
 import time
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import date, timedelta
-from typing import Callable, Iterator
 
 from config import Settings
 
@@ -55,7 +55,7 @@ class ImapWatcher:
             self.client.logout()
         self.client = None
 
-    def __enter__(self) -> "ImapWatcher":
+    def __enter__(self) -> ImapWatcher:
         self.connect()
         return self
 
@@ -104,24 +104,99 @@ class ImapWatcher:
             return []
         return [int(item) for item in data[0].decode().split() if item.isdigit() and int(item) > last_seen_uid]
 
+    def _idle_wait(self, stop_event, max_seconds: int) -> bool:
+        """尝试用 IMAP IDLE 等待新邮件。成功返回 True（可能有新邮件），
+        不支持或出错返回 False，调用方回退到轮询。"""
+        client = self.client
+        if client is None or not self._idle_supported:
+            return False
+        try:
+            tag = client._new_tag()
+            client.send(tag + b" IDLE\r\n")
+            # 等待服务器 '+ idling' 续行响应
+            resp = client.readline()
+            if not resp.startswith(b"+"):
+                with suppress(Exception):
+                    client.send(b"DONE\r\n")
+                    client.readline()
+                return False
+            sock = client.socket()
+            original_timeout = sock.gettimeout()
+            deadline = time.monotonic() + max_seconds
+            got_update = False
+            try:
+                while not stop_event.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sock.settimeout(min(5, remaining))
+                    try:
+                        line = client.readline()
+                    except OSError:
+                        break
+                    if not line:
+                        break
+                    upper = line.upper()
+                    if b"EXISTS" in upper or b"RECENT" in upper:
+                        got_update = True
+                        break
+            finally:
+                sock.settimeout(original_timeout)
+                with suppress(Exception):
+                    client.send(b"DONE\r\n")
+                    client.readline()
+            return got_update
+        except Exception as exc:  # 回退轮询
+            self.logger(f"IDLE 失败，回退到轮询：{type(exc).__name__}")
+            self._idle_supported = False
+            return False
+
     def iter_new_uids(self, start_after_uid: int, stop_event) -> Iterator[int]:
         last_seen = start_after_uid
         idle_notice_sent = False
+        reconnect_attempts = 0
+        max_reconnect = 6
         while not stop_event.is_set():
             try:
-                if self._idle_supported and self.settings.prefer_idle and not idle_notice_sent:
-                    self.logger("IMAP 服务器支持 IDLE；本版本用 UID 轻量轮询兜底，避免标准库私有协议在公司邮箱上不稳定。")
-                    idle_notice_sent = True
+                if self._idle_supported and self.settings.prefer_idle:
+                    if not idle_notice_sent:
+                        self.logger("IMAP 服务器支持 IDLE，已启用推送模式（失败自动回退轮询）。")
+                        idle_notice_sent = True
+                    for uid in self.search_new_uids(last_seen):
+                        last_seen = max(last_seen, uid)
+                        yield uid
+                    reconnect_attempts = 0
+                    idle_window = max(30, min(1500, self.settings.poll_interval * 6))
+                    used_idle = self._idle_wait(stop_event, idle_window)
+                    if not used_idle and not stop_event.is_set():
+                        # IDLE 不可用则退回定时轮询节奏
+                        slept = 0
+                        interval = max(5, self.settings.poll_interval)
+                        while slept < interval and not stop_event.is_set():
+                            time.sleep(1)
+                            slept += 1
+                    continue
                 for uid in self.search_new_uids(last_seen):
                     last_seen = max(last_seen, uid)
                     yield uid
+                reconnect_attempts = 0
                 slept = 0
                 interval = max(5, self.settings.poll_interval)
                 while slept < interval and not stop_event.is_set():
                     time.sleep(1)
                     slept += 1
             except imaplib.IMAP4.abort:
-                self.logger("IMAP 连接中断，准备自动重连。")
+                reconnect_attempts += 1
+                if reconnect_attempts > max_reconnect:
+                    self.logger(f"IMAP 连接已连续中断 {max_reconnect} 次，停止自动重连。请检查网络与邮箱配置。")
+                    raise
+                backoff = min(60, 3 * (2 ** (reconnect_attempts - 1)))
+                self.logger(f"IMAP 连接中断，{backoff}s 后自动重连（第 {reconnect_attempts}/{max_reconnect} 次）。")
                 self.close()
-                time.sleep(3)
+                slept = 0
+                while slept < backoff and not stop_event.is_set():
+                    time.sleep(1)
+                    slept += 1
+                if stop_event.is_set():
+                    return
                 self.connect()

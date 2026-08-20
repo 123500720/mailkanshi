@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime
+from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 def utcnow_text() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + "Z"
 
 
 class Storage:
@@ -21,6 +22,7 @@ class Storage:
         with self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -68,6 +70,9 @@ class Storage:
                     rule_hit TEXT NOT NULL DEFAULT '',
                     summary TEXT NOT NULL DEFAULT '',
                     body_preview TEXT NOT NULL DEFAULT '',
+                    attachments TEXT NOT NULL DEFAULT '',
+                    categories TEXT NOT NULL DEFAULT '',
+                    action_items TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'done',
                     error TEXT NOT NULL DEFAULT '',
                     processed_at TEXT NOT NULL,
@@ -86,8 +91,28 @@ class Storage:
                     message TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS ai_cache (
+                    content_hash TEXT PRIMARY KEY,
+                    category TEXT NOT NULL DEFAULT '其他',
+                    summary TEXT NOT NULL DEFAULT '',
+                    importance TEXT NOT NULL DEFAULT 'normal',
+                    categories TEXT NOT NULL DEFAULT '',
+                    action_items TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
                 """
             )
+            self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(mails)")}
+        for name in ("attachments", "categories", "action_items"):
+            if name not in cols:
+                with suppress(sqlite3.OperationalError):
+                    self._conn.execute(
+                        f"ALTER TABLE mails ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                    )
 
     def close(self) -> None:
         with self._lock:
@@ -139,6 +164,37 @@ class Storage:
                     updated_at=excluded.updated_at
                 """,
                 (mailbox_key, uidvalidity, baseline_uid, last_seen_uid, utcnow_text()),
+            )
+
+    def get_ai_cache(self, content_hash: str) -> dict[str, Any] | None:
+        if not content_hash:
+            return None
+        row = self._conn.execute(
+            "SELECT category, summary, importance, categories, action_items "
+            "FROM ai_cache WHERE content_hash=?",
+            (content_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def put_ai_cache(self, content_hash: str, decision: dict[str, Any]) -> None:
+        if not content_hash:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO ai_cache(
+                    content_hash, category, summary, importance, categories, action_items, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    content_hash,
+                    decision.get("category", "其他"),
+                    decision.get("summary", ""),
+                    decision.get("importance", "normal"),
+                    decision.get("categories", ""),
+                    decision.get("action_items", ""),
+                    utcnow_text(),
+                ),
             )
 
     def has_uid(self, mailbox_key: str, uidvalidity: str, uid: int) -> bool:
@@ -247,6 +303,9 @@ class Storage:
             "rule_hit": record.get("rule_hit", ""),
             "summary": record.get("summary", ""),
             "body_preview": record.get("body_preview", ""),
+            "attachments": record.get("attachments", ""),
+            "categories": record.get("categories", ""),
+            "action_items": record.get("action_items", ""),
             "status": record.get("status", "done"),
             "error": record.get("error", ""),
             "processed_at": record.get("processed_at", utcnow_text()),
