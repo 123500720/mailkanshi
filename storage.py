@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,9 @@ class Storage:
                     rule_hit TEXT NOT NULL DEFAULT '',
                     summary TEXT NOT NULL DEFAULT '',
                     body_preview TEXT NOT NULL DEFAULT '',
+                    attachments TEXT NOT NULL DEFAULT '',
+                    categories TEXT NOT NULL DEFAULT '',
+                    action_items TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'done',
                     error TEXT NOT NULL DEFAULT '',
                     processed_at TEXT NOT NULL,
@@ -88,6 +92,16 @@ class Storage:
                 );
                 """
             )
+            self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(mails)")}
+        for name in ("attachments", "categories", "action_items"):
+            if name not in cols:
+                with suppress(sqlite3.OperationalError):
+                    self._conn.execute(
+                        f"ALTER TABLE mails ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                    )
 
     def close(self) -> None:
         with self._lock:
@@ -247,6 +261,9 @@ class Storage:
             "rule_hit": record.get("rule_hit", ""),
             "summary": record.get("summary", ""),
             "body_preview": record.get("body_preview", ""),
+            "attachments": record.get("attachments", ""),
+            "categories": record.get("categories", ""),
+            "action_items": record.get("action_items", ""),
             "status": record.get("status", "done"),
             "error": record.get("error", ""),
             "processed_at": record.get("processed_at", utcnow_text()),

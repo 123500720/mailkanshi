@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import traceback
 from base64 import b64encode
 from collections.abc import Callable
@@ -19,6 +20,20 @@ from storage import Storage, utcnow_text
 LogCallback = Callable[[str], None]
 ResultCallback = Callable[[dict], None]
 ProgressCallback = Callable[[int, int], None]
+
+
+def _attachments_text(parsed: ParsedMail) -> str:
+    if not parsed.attachments:
+        return ""
+    parts = []
+    for att in parsed.attachments:
+        name = att.get("filename", "")
+        size = att.get("size", 0)
+        if size:
+            parts.append(f"{name}({size}B)")
+        else:
+            parts.append(name)
+    return "; ".join(p for p in parts if p)
 
 
 class MonitorService:
@@ -61,6 +76,34 @@ class MonitorService:
     def notify_result(self, row: dict) -> None:
         if self.result_callback:
             self.result_callback(row)
+
+    def _maybe_desktop_notify(self, record: dict) -> None:
+        if record.get("importance") != "high":
+            return
+        if not getattr(self.settings, "desktop_notify", True):
+            return
+        title = "高优先邮件"
+        summary = record.get("summary") or record.get("subject") or ""
+        sender = record.get("sender", "")
+        message = f"{sender}: {summary}"[:200]
+        with suppress(Exception):
+            self._send_desktop_notification(title, message)
+
+    def _send_desktop_notification(self, title: str, message: str) -> None:
+        try:
+            from plyer import notification  # type: ignore
+
+            notification.notify(title=title, message=message, timeout=10)
+            return
+        except Exception:
+            pass
+        import sys
+
+        if sys.platform.startswith("win"):
+            with suppress(Exception):
+                import ctypes
+
+                ctypes.windll.user32.MessageBeep(0)
 
     def notify_progress(self, current: int, total: int) -> None:
         if self.progress_callback:
@@ -162,6 +205,9 @@ class MonitorService:
                 "rule_hit": decision["rule_hit"],
                 "summary": decision["summary"],
                 "body_preview": parsed.body_preview,
+                "attachments": _attachments_text(parsed),
+                "categories": decision.get("categories", ""),
+                "action_items": decision.get("action_items", ""),
                 "status": "done",
                 "error": "",
                 "processed_at": utcnow_text(),
@@ -171,6 +217,7 @@ class MonitorService:
             self.storage.finish_job(job["id"])
             self.exporter.append_default_outputs(record)
             self.notify_result(record)
+            self._maybe_desktop_notify(record)
             self.log(f"邮件 UID={uid} 处理完成：{record['category']} / {record['importance']}")
         except Exception as exc:  # pragma: no cover - integration path
             message = f"{type(exc).__name__}: {exc}"
@@ -216,11 +263,14 @@ class MonitorService:
         rule = self.rule_engine.evaluate(parsed)
         ai: AiDecision = self.ollama.analyze(parsed)
         importance = rule.forced_importance or ai.importance
+        categories = ai.categories or ([ai.category] if ai.category else [])
         return {
             "category": ai.category,
             "summary": ai.summary,
             "importance": importance,
             "rule_hit": rule.matched_rule,
+            "categories": "、".join(categories),
+            "action_items": json.dumps(ai.action_items, ensure_ascii=False) if ai.action_items else "",
         }
 
     def _build_duplicate_record(self, parsed: ParsedMail, uidvalidity: str, duplicate_reason: str) -> dict:
@@ -240,6 +290,9 @@ class MonitorService:
             "rule_hit": duplicate_reason,
             "summary": "重复邮件，已跳过。",
             "body_preview": parsed.body_preview,
+            "attachments": _attachments_text(parsed),
+            "categories": "",
+            "action_items": "",
             "status": "duplicate",
             "error": "",
             "processed_at": utcnow_text(),
