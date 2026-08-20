@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite
+*.sqlite3
+*.log
+index.md
+results.jsonl
+exports/
+processed_uids.txt
+processed_mids.txt
