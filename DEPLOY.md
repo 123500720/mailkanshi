@@ -65,10 +65,11 @@ python mail_monitor_tk.py
 
 ## 7. 当前技术说明
 
-Python 标准库没有稳定公开的 IMAP IDLE API，所以本版使用“UID 增量轻量轮询”实现接近实时监控。要满足 10 秒验收，保持：
+Python 标准库支持 IMAP IDLE 推送（`PREFER_IDLE=1`，默认）以降低空闲占用；IDLE 不可用时会自动回退到“UID 增量轻量轮询”。要满足 10 秒验收，保持：
 
 ```env
 POLL_INTERVAL=10
+PREFER_IDLE=1
 ```
 
 ## 8. P0 可靠性优化说明

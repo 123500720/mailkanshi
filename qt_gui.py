@@ -93,9 +93,18 @@ class FirstRunDialog(QDialog):
         ai_box = QGroupBox("3. 本地 Ollama")
         ai_form = QFormLayout(ai_box)
         self.ollama_edit = QLineEdit(settings.ollama_base_url)
-        self.model_edit = QLineEdit(settings.ollama_model)
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        if settings.ollama_model:
+            self.model_combo.addItem(settings.ollama_model)
+        self.model_combo.setEditText(settings.ollama_model)
+        refresh_model_btn = QPushButton("刷新模型")
+        refresh_model_btn.clicked.connect(self._load_models)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.model_combo, 1)
+        model_row.addWidget(refresh_model_btn)
         ai_form.addRow("Ollama 地址", self.ollama_edit)
-        ai_form.addRow("模型", self.model_edit)
+        ai_form.addRow("模型", model_row)
         layout.addWidget(ai_box)
 
         test_row = QHBoxLayout()
@@ -130,7 +139,7 @@ class FirstRunDialog(QDialog):
             "password": self.password_edit.text().strip(),
             "folder": self.folder_edit.text().strip() or "INBOX",
             "ollama_url": self.ollama_edit.text().strip() or "http://localhost:11434",
-            "model": self.model_edit.text().strip(),
+            "model": self.model_combo.currentText().strip(),
             "autostart": self.autostart_check.isChecked(),
         }
 
@@ -161,6 +170,28 @@ class FirstRunDialog(QDialog):
             response = requests.get(url + "/api/tags", timeout=8, proxies=proxies)
             response.raise_for_status()
             self.ollama_result.setText("Ollama 测试成功")
+            self.ollama_result.setStyleSheet("color:#22c55e")
+        except Exception as exc:
+            msg = humanize_error(f"Ollama {type(exc).__name__}: {exc}")
+            self.ollama_result.setText(msg)
+            self.ollama_result.setStyleSheet("color:#ef4444")
+
+    def _load_models(self) -> None:
+        try:
+            values = self.values()
+            url = str(values["ollama_url"]).rstrip("/")
+            proxies = None
+            if any(h in url for h in ("localhost", "127.0.0.1", "::1")):
+                proxies = {"http": None, "https": None}
+            response = requests.get(url + "/api/tags", timeout=8, proxies=proxies)
+            response.raise_for_status()
+            models = [m["name"] for m in response.json().get("models", []) if m.get("name")]
+            current = self.model_combo.currentText().strip()
+            self.model_combo.clear()
+            self.model_combo.addItems(models or ([current] if current else []))
+            if current:
+                self.model_combo.setEditText(current)
+            self.ollama_result.setText(f"已载入 {len(models)} 个模型")
             self.ollama_result.setStyleSheet("color:#22c55e")
         except Exception as exc:
             msg = humanize_error(f"Ollama {type(exc).__name__}: {exc}")
@@ -206,6 +237,19 @@ class MailMonitorModernWindow(QMainWindow):
         self.ssl_check = QCheckBox("SSL 连接")
         self.ssl_check.setChecked(s.imap_ssl)
         self.poll_edit = QLineEdit(str(s.poll_interval))
+        self.prefer_idle_check = QCheckBox("优先使用 IMAP IDLE 推送（降低空闲占用）")
+        self.prefer_idle_check.setChecked(s.prefer_idle)
+        self.recipient_filter_combo = QComboBox()
+        self._recipient_filter_values = ["off", "to_or_cc_me", "watched"]
+        self.recipient_filter_combo.addItems([
+            "不过滤（处理全部）",
+            "只处理发/抄给我的",
+            "只处理发/抄给指定地址的",
+        ])
+        _rf = s.recipient_filter if s.recipient_filter in self._recipient_filter_values else "off"
+        self.recipient_filter_combo.setCurrentIndex(self._recipient_filter_values.index(_rf))
+        self.watched_addresses_edit = QLineEdit(", ".join(s.watched_addresses))
+        self.watched_addresses_edit.setPlaceholderText("多个地址用逗号分隔，如 a@x.com, b@y.com")
 
         self.ollama_url_edit = QLineEdit(s.ollama_base_url)
         self.model_combo = QComboBox()
@@ -459,11 +503,22 @@ class MailMonitorModernWindow(QMainWindow):
         imap_form.addRow("文件夹", self.folder_edit)
         imap_form.addRow("SSL", self.ssl_check)
         imap_form.addRow("监控间隔秒", self.poll_edit)
+        imap_form.addRow("", self.prefer_idle_check)
+
+        filter_box = QGroupBox("监听源过滤")
+        filter_form = QFormLayout(filter_box)
+        filter_form.addRow("范围", self.recipient_filter_combo)
+        filter_form.addRow("指定地址", self.watched_addresses_edit)
 
         ai_box = QGroupBox("本地 Ollama")
         ai_form = QFormLayout(ai_box)
         ai_form.addRow("地址", self.ollama_url_edit)
-        ai_form.addRow("模型", self.model_combo)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.model_combo, 1)
+        refresh_btn = QPushButton("刷新模型")
+        refresh_btn.clicked.connect(self.refresh_models)
+        model_row.addWidget(refresh_btn)
+        ai_form.addRow("模型", model_row)
         ai_form.addRow("线程数", self.thread_edit)
         ai_form.addRow("上下文", self.ctx_edit)
         ai_form.addRow("超时秒", self.timeout_edit)
@@ -477,8 +532,9 @@ class MailMonitorModernWindow(QMainWindow):
 
         grid.addWidget(imap_box, 0, 0)
         grid.addWidget(ai_box, 0, 1)
-        grid.addWidget(storage_box, 1, 0, 1, 2)
-        grid.setRowStretch(2, 1)
+        grid.addWidget(filter_box, 1, 0, 1, 2)
+        grid.addWidget(storage_box, 2, 0, 1, 2)
+        grid.setRowStretch(3, 1)
         return page
 
     def _logs(self) -> QWidget:
@@ -561,6 +617,9 @@ class MailMonitorModernWindow(QMainWindow):
         settings.imap_folder = self.folder_edit.text().strip() or "INBOX"
         settings.imap_ssl = self.ssl_check.isChecked()
         settings.poll_interval = self._parse_int_field(self.poll_edit, "监控间隔", 10, 3)
+        settings.prefer_idle = self.prefer_idle_check.isChecked()
+        settings.recipient_filter = self._recipient_filter_values[self.recipient_filter_combo.currentIndex()]
+        settings.watched_addresses = [a.lower() for a in self._csv(self.watched_addresses_edit.text())]
         settings.ollama_base_url = self.ollama_url_edit.text().strip() or "http://localhost:11434"
         settings.ollama_model = self.model_combo.currentText().strip() or settings.ollama_model
         settings.ollama_num_thread = self._parse_int_field(self.thread_edit, "线程数", 8, 3)
@@ -611,13 +670,16 @@ class MailMonitorModernWindow(QMainWindow):
             "IMAP_SEARCH=ALL",
             f"IMAP_TIMEOUT={settings.imap_timeout}",
             f"POLL_INTERVAL={settings.poll_interval}",
-            "PREFER_IDLE=0",
+            f"PREFER_IDLE={1 if settings.prefer_idle else 0}",
+            f"RECIPIENT_FILTER={settings.recipient_filter}",
+            f"WATCHED_ADDRESSES={','.join(settings.watched_addresses)}",
             "",
             f"OLLAMA_BASE_URL={settings.ollama_base_url}",
             f"OLLAMA_MODEL={settings.ollama_model}",
             f"OLLAMA_TIMEOUT={settings.ollama_timeout}",
             f"OLLAMA_NUM_THREAD={settings.ollama_num_thread}",
             f"OLLAMA_NUM_CTX={settings.ollama_num_ctx}",
+            f"OLLAMA_KEEP_ALIVE={settings.ollama_keep_alive}",
             f"ALLOW_REMOTE_OLLAMA={1 if settings.allow_remote_ollama else 0}",
             "",
             f"AI_BODY_MAX_LEN={settings.ai_body_max_len}",

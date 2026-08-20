@@ -37,6 +37,25 @@ def _attachments_text(parsed: ParsedMail) -> str:
     return "; ".join(p for p in parts if p)
 
 
+def recipient_allowed(parsed: ParsedMail, settings: Settings) -> bool:
+    """按监听源过滤：判断该邮件是否属于关注范围。"""
+    mode = (getattr(settings, "recipient_filter", "off") or "off").lower()
+    if mode in ("", "off"):
+        return True
+    recipients = set(parsed.to_addresses) | set(parsed.cc_addresses)
+    if mode == "to_or_cc_me":
+        me = (settings.imap_username or "").strip().lower()
+        if not me:
+            return True
+        return me in recipients
+    if mode == "watched":
+        watched = {a.strip().lower() for a in getattr(settings, "watched_addresses", []) if a.strip()}
+        if not watched:
+            return True
+        return bool(recipients & watched)
+    return True
+
+
 class MonitorService:
     def __init__(
         self,
@@ -178,6 +197,11 @@ class MonitorService:
                 return
             raw_bytes = watcher.fetch_message(uid)
             parsed = parse_email_bytes(raw_bytes, uid, preview_len=self.settings.body_preview_len)
+            if not recipient_allowed(parsed, self.settings):
+                self.storage.update_last_seen_uid(self.settings.mailbox_key, uidvalidity, uid)
+                self.storage.finish_job(job["id"])
+                self.log(f"邮件 UID={uid} 不在监听源范围内，已跳过（未调用 AI）。")
+                return
             duplicate_reason = self._detect_duplicate(parsed)
             if duplicate_reason:
                 record = self._build_duplicate_record(parsed, uidvalidity, duplicate_reason)

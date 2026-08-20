@@ -63,6 +63,7 @@ class Settings:
     ollama_timeout: int = 120
     ollama_num_thread: int = 8
     ollama_num_ctx: int = 2048
+    ollama_keep_alive: str = "0"
     allow_remote_ollama: bool = False
 
     ai_body_max_len: int = 3000
@@ -72,7 +73,15 @@ class Settings:
     categories: list[str] = field(default_factory=lambda: list(DEFAULT_CATEGORIES))
 
     rule_whitelist: list[str] = field(default_factory=list)
-    rule_keywords: list[str] = field(default_factory=lambda: ["紧急", "urgent", "asap", "加急", "重要", "important"])
+    rule_keywords: list[str] = field(default_factory=lambda: [
+        "紧急", "urgent", "asap", "加急", "重要", "important",
+        "緊急", "至急", "大至急", "重要", "お願い", "催促", "リマインド",
+    ])
+
+    # 监听源过滤：off=不过滤；to_or_cc_me=只处理发/抄给本账号的；
+    # watched=只处理发/抄给 watched_addresses 里任一地址的。
+    recipient_filter: str = "off"
+    watched_addresses: list[str] = field(default_factory=list)
 
     db_path: Path = Path("mail_monitor.db")
     output_md: Path = Path("index.md")
@@ -136,6 +145,7 @@ def load_settings(workspace: str | Path | None = None, env_file: str = ".env") -
         ollama_timeout=_safe_int(os.getenv("OLLAMA_TIMEOUT"), 120),
         ollama_num_thread=_safe_int(os.getenv("OLLAMA_NUM_THREAD"), 8),
         ollama_num_ctx=_safe_int(os.getenv("OLLAMA_NUM_CTX"), 2048),
+        ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "0"),
         allow_remote_ollama=_parse_bool(os.getenv("ALLOW_REMOTE_OLLAMA"), False),
         ai_body_max_len=_safe_int(os.getenv("AI_BODY_MAX_LEN"), 3000),
         body_preview_len=_safe_int(os.getenv("BODY_PREVIEW_LEN"), 200),
@@ -143,7 +153,12 @@ def load_settings(workspace: str | Path | None = None, env_file: str = ".env") -
         ai_cache_enabled=_parse_bool(os.getenv("AI_CACHE_ENABLED"), True),
         categories=_parse_csv(os.getenv("CATEGORIES")) or list(DEFAULT_CATEGORIES),
         rule_whitelist=_parse_csv(os.getenv("RULE_WHITELIST")),
-        rule_keywords=_parse_csv(os.getenv("RULE_KEYWORDS")) or ["紧急", "urgent", "asap", "加急", "重要", "important"],
+        rule_keywords=_parse_csv(os.getenv("RULE_KEYWORDS")) or [
+            "紧急", "urgent", "asap", "加急", "重要", "important",
+            "緊急", "至急", "大至急", "重要", "お願い", "催促", "リマインド",
+        ],
+        recipient_filter=(os.getenv("RECIPIENT_FILTER", "off") or "off").strip().lower(),
+        watched_addresses=[a.lower() for a in _parse_csv(os.getenv("WATCHED_ADDRESSES"))],
         db_path=Path(os.getenv("DB_PATH", "mail_monitor.db")),
         output_md=Path(os.getenv("OUTPUT_MD", "index.md")),
         results_jsonl=Path(os.getenv("RESULTS_JSONL", "results.jsonl")),
