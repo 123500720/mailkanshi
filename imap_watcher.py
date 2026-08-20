@@ -107,6 +107,8 @@ class ImapWatcher:
     def iter_new_uids(self, start_after_uid: int, stop_event) -> Iterator[int]:
         last_seen = start_after_uid
         idle_notice_sent = False
+        reconnect_attempts = 0
+        max_reconnect = 6
         while not stop_event.is_set():
             try:
                 if self._idle_supported and self.settings.prefer_idle and not idle_notice_sent:
@@ -115,13 +117,24 @@ class ImapWatcher:
                 for uid in self.search_new_uids(last_seen):
                     last_seen = max(last_seen, uid)
                     yield uid
+                reconnect_attempts = 0
                 slept = 0
                 interval = max(5, self.settings.poll_interval)
                 while slept < interval and not stop_event.is_set():
                     time.sleep(1)
                     slept += 1
             except imaplib.IMAP4.abort:
-                self.logger("IMAP 连接中断，准备自动重连。")
+                reconnect_attempts += 1
+                if reconnect_attempts > max_reconnect:
+                    self.logger(f"IMAP 连接已连续中断 {max_reconnect} 次，停止自动重连。请检查网络与邮箱配置。")
+                    raise
+                backoff = min(60, 3 * (2 ** (reconnect_attempts - 1)))
+                self.logger(f"IMAP 连接中断，{backoff}s 后自动重连（第 {reconnect_attempts}/{max_reconnect} 次）。")
                 self.close()
-                time.sleep(3)
+                slept = 0
+                while slept < backoff and not stop_event.is_set():
+                    time.sleep(1)
+                    slept += 1
+                if stop_event.is_set():
+                    return
                 self.connect()

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import traceback
+from base64 import b64encode
+from contextlib import suppress
 from datetime import date
 from threading import Event
 from typing import Callable
+from urllib.parse import quote
 
 from config import Settings
 from exporter import Exporter
@@ -38,10 +41,23 @@ class MonitorService:
         self.progress_callback = progress_callback
 
     def log(self, message: str, level: str = "INFO") -> None:
-        safe_message = message.replace(self.settings.imap_password, "***") if self.settings.imap_password else message
+        safe_message = self._redact(message)
         self.storage.append_log(level, safe_message)
         if self.log_callback:
             self.log_callback(safe_message)
+
+    def _redact(self, message: str) -> str:
+        safe = message
+        secrets = [self.settings.imap_password]
+        for secret in secrets:
+            if not secret:
+                continue
+            safe = safe.replace(secret, "***")
+            with suppress(Exception):
+                safe = safe.replace(quote(secret), "***")
+            with suppress(Exception):
+                safe = safe.replace(b64encode(secret.encode()).decode(), "***")
+        return safe
 
     def notify_result(self, row: dict) -> None:
         if self.result_callback:
@@ -125,7 +141,7 @@ class MonitorService:
                 self.storage.save_mail(record)
                 self.storage.update_last_seen_uid(self.settings.mailbox_key, uidvalidity, uid)
                 self.storage.finish_job(job["id"])
-                self.exporter.sync_default_outputs()
+                self.exporter.append_default_outputs(record)
                 self.notify_result(record)
                 self.log(f"邮件 UID={uid} 因 {duplicate_reason} 被去重。")
                 return
@@ -154,7 +170,7 @@ class MonitorService:
             self.storage.save_mail(record)
             self.storage.update_last_seen_uid(self.settings.mailbox_key, uidvalidity, uid)
             self.storage.finish_job(job["id"])
-            self.exporter.sync_default_outputs()
+            self.exporter.append_default_outputs(record)
             self.notify_result(record)
             self.log(f"邮件 UID={uid} 处理完成：{record['category']} / {record['importance']}")
         except Exception as exc:  # pragma: no cover - integration path
@@ -185,7 +201,7 @@ class MonitorService:
                 }
                 self.storage.save_mail(record)
                 self.storage.fail_job(job["id"], message)
-                self.exporter.sync_default_outputs()
+                self.exporter.append_default_outputs(record)
                 self.notify_result(record)
                 self.log(f"邮件 UID={uid} 最终失败：{message}", level="ERROR")
                 self.log(traceback.format_exc(limit=3), level="ERROR")
