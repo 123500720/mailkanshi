@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import traceback
 from base64 import b64encode
@@ -259,12 +260,31 @@ class MonitorService:
             return "3秒主题窗口去重"
         return ""
 
+    def _content_hash(self, parsed: ParsedMail) -> str:
+        raw = f"{parsed.sender_address}\n{parsed.subject}\n{parsed.body_text}".encode()
+        return hashlib.sha256(raw).hexdigest()
+
     def _analyze_mail(self, parsed: ParsedMail) -> dict[str, str]:
         rule = self.rule_engine.evaluate(parsed)
+        content_hash = self._content_hash(parsed)
+        cached = None
+        if getattr(self.settings, "ai_cache_enabled", True):
+            cached = self.storage.get_ai_cache(content_hash)
+        if cached:
+            self.log(f"命中 AI 缓存（内容哈希 {content_hash[:8]}），跳过 LLM 调用。")
+            importance = rule.forced_importance or cached.get("importance", "normal")
+            return {
+                "category": cached.get("category", "其他"),
+                "summary": cached.get("summary", ""),
+                "importance": importance,
+                "rule_hit": rule.matched_rule,
+                "categories": cached.get("categories", ""),
+                "action_items": cached.get("action_items", ""),
+            }
         ai: AiDecision = self.ollama.analyze(parsed)
         importance = rule.forced_importance or ai.importance
         categories = ai.categories or ([ai.category] if ai.category else [])
-        return {
+        result = {
             "category": ai.category,
             "summary": ai.summary,
             "importance": importance,
@@ -272,6 +292,10 @@ class MonitorService:
             "categories": "、".join(categories),
             "action_items": json.dumps(ai.action_items, ensure_ascii=False) if ai.action_items else "",
         }
+        if getattr(self.settings, "ai_cache_enabled", True):
+            with suppress(Exception):
+                self.storage.put_ai_cache(content_hash, {**result, "importance": ai.importance})
+        return result
 
     def _build_duplicate_record(self, parsed: ParsedMail, uidvalidity: str, duplicate_reason: str) -> dict:
         return {

@@ -22,6 +22,7 @@ class Storage:
         with self._conn:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -90,6 +91,16 @@ class Storage:
                     message TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS ai_cache (
+                    content_hash TEXT PRIMARY KEY,
+                    category TEXT NOT NULL DEFAULT '其他',
+                    summary TEXT NOT NULL DEFAULT '',
+                    importance TEXT NOT NULL DEFAULT 'normal',
+                    categories TEXT NOT NULL DEFAULT '',
+                    action_items TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._migrate()
@@ -153,6 +164,37 @@ class Storage:
                     updated_at=excluded.updated_at
                 """,
                 (mailbox_key, uidvalidity, baseline_uid, last_seen_uid, utcnow_text()),
+            )
+
+    def get_ai_cache(self, content_hash: str) -> dict[str, Any] | None:
+        if not content_hash:
+            return None
+        row = self._conn.execute(
+            "SELECT category, summary, importance, categories, action_items "
+            "FROM ai_cache WHERE content_hash=?",
+            (content_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def put_ai_cache(self, content_hash: str, decision: dict[str, Any]) -> None:
+        if not content_hash:
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO ai_cache(
+                    content_hash, category, summary, importance, categories, action_items, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    content_hash,
+                    decision.get("category", "其他"),
+                    decision.get("summary", ""),
+                    decision.get("importance", "normal"),
+                    decision.get("categories", ""),
+                    decision.get("action_items", ""),
+                    utcnow_text(),
+                ),
             )
 
     def has_uid(self, mailbox_key: str, uidvalidity: str, uid: int) -> bool:

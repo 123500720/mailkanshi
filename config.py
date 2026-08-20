@@ -68,6 +68,7 @@ class Settings:
     ai_body_max_len: int = 3000
     body_preview_len: int = 200
     desktop_notify: bool = True
+    ai_cache_enabled: bool = True
     categories: list[str] = field(default_factory=lambda: list(DEFAULT_CATEGORIES))
 
     rule_whitelist: list[str] = field(default_factory=list)
@@ -139,6 +140,7 @@ def load_settings(workspace: str | Path | None = None, env_file: str = ".env") -
         ai_body_max_len=_safe_int(os.getenv("AI_BODY_MAX_LEN"), 3000),
         body_preview_len=_safe_int(os.getenv("BODY_PREVIEW_LEN"), 200),
         desktop_notify=_parse_bool(os.getenv("DESKTOP_NOTIFY"), True),
+        ai_cache_enabled=_parse_bool(os.getenv("AI_CACHE_ENABLED"), True),
         categories=_parse_csv(os.getenv("CATEGORIES")) or list(DEFAULT_CATEGORIES),
         rule_whitelist=_parse_csv(os.getenv("RULE_WHITELIST")),
         rule_keywords=_parse_csv(os.getenv("RULE_KEYWORDS")) or ["紧急", "urgent", "asap", "加急", "重要", "important"],
