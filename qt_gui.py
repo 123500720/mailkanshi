@@ -154,7 +154,11 @@ class FirstRunDialog(QDialog):
     def test_ollama(self) -> None:
         try:
             values = self.values()
-            response = requests.get(str(values["ollama_url"]).rstrip("/") + "/api/tags", timeout=8)
+            url = str(values["ollama_url"]).rstrip("/")
+            proxies = None
+            if any(h in url for h in ("localhost", "127.0.0.1", "::1")):
+                proxies = {"http": None, "https": None}
+            response = requests.get(url + "/api/tags", timeout=8, proxies=proxies)
             response.raise_for_status()
             self.ollama_result.setText("Ollama 测试成功")
             self.ollama_result.setStyleSheet("color:#22c55e")

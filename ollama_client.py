@@ -4,11 +4,14 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
 from config import Settings
 from mail_parser import ParsedMail
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 
 @dataclass
@@ -25,6 +28,17 @@ class OllamaClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.session = requests.Session()
+        # 本地 Ollama 不应经过公司代理，否则会被代理拦截（504）。
+        if self._is_local(settings.ollama_base_url):
+            self.session.trust_env = False
+
+    @staticmethod
+    def _is_local(base_url: str) -> bool:
+        try:
+            host = urlparse(base_url).hostname or ""
+        except ValueError:
+            return False
+        return host.lower() in _LOCAL_HOSTS
 
     def list_models(self) -> list[str]:
         response = self.session.get(
