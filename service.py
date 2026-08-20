@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import traceback
 from base64 import b64encode
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import date
 from threading import Event
-from typing import Callable
 from urllib.parse import quote
 
 from config import Settings
@@ -15,7 +15,6 @@ from mail_parser import ParsedMail, parse_email_bytes
 from ollama_client import AiDecision, OllamaClient
 from rules import RuleEngine
 from storage import Storage, utcnow_text
-
 
 LogCallback = Callable[[str], None]
 ResultCallback = Callable[[dict], None]

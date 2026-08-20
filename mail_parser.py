@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
-from email.utils import parsedate_to_datetime, parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 
 
 def _decode_header(value: str | None) -> str:

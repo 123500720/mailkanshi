@@ -7,7 +7,6 @@ from pathlib import Path
 from config import Settings
 from storage import Storage
 
-
 EXPORT_FIELDS = [
     "processed_at",
     "received_at",

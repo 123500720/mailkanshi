@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import imaplib
 import time
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import date, timedelta
-from typing import Callable, Iterator
 
 from config import Settings
 
@@ -55,7 +55,7 @@ class ImapWatcher:
             self.client.logout()
         self.client = None
 
-    def __enter__(self) -> "ImapWatcher":
+    def __enter__(self) -> ImapWatcher:
         self.connect()
         return self
 
