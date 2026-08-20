@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import imaplib
 import sys
-import threading
-import traceback
 from copy import deepcopy
 from datetime import date, timedelta
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -14,11 +11,12 @@ import requests
 from config import Settings, load_settings
 from diagnostics import humanize_error
 from exporter import Exporter
-from service import MonitorService
+from qt_theme import APP_QSS, STATE_META
+from qt_worker import ServiceThread
 from storage import Storage
 
 try:
-    from PySide6.QtCore import Qt, QThread, Signal, QDate, QTimer
+    from PySide6.QtCore import QDate, Qt, QTimer
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (
         QApplication,
@@ -54,32 +52,6 @@ try:
 except ImportError as exc:
     raise RuntimeError("缺少 PySide6。请运行：pip install PySide6") from exc
 
-APP_QSS = """
-QMainWindow,QWidget{background:#0f172a;color:#e5e7eb;font-family:'Microsoft YaHei UI','Segoe UI';font-size:13px}
-QFrame#Sidebar{background:#0b1120;border-right:1px solid #1e293b} QLabel#AppTitle{font-size:20px;font-weight:800;color:#f8fafc}
-QLabel#HeroTitle{font-size:24px;font-weight:800;color:#f8fafc} QLabel#Muted{color:#94a3b8}
-QPushButton{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:9px 13px;color:#e5e7eb} QPushButton:hover{background:#334155} QPushButton:disabled{background:#111827;color:#64748b;border-color:#1f2937}
-QPushButton#PrimaryButton{background:#2563eb;border-color:#3b82f6;color:white;font-weight:700} QPushButton#PrimaryButton:hover{background:#1d4ed8}
-QPushButton#DangerButton{background:#7f1d1d;border-color:#991b1b;color:#fee2e2;font-weight:700}
-QPushButton#NavButton{text-align:left;border:0;border-radius:12px;padding:11px 14px;color:#cbd5e1;background:transparent} QPushButton#NavButton:checked{background:#1d4ed8;color:white;font-weight:700}
-QFrame#TopBar,QFrame#Card,QGroupBox{background:#111c33;border:1px solid #243044;border-radius:16px} QGroupBox{margin-top:12px;padding:16px 12px 12px 12px;font-weight:700}
-QGroupBox::title{subcontrol-origin:margin;left:14px;padding:0 6px;color:#bfdbfe}
-QLineEdit,QComboBox,QDateEdit,QPlainTextEdit,QTextEdit{background:#0b1220;border:1px solid #334155;border-radius:10px;padding:8px;color:#f8fafc;selection-background-color:#2563eb}
-QLineEdit[invalid="true"],QComboBox[invalid="true"],QDateEdit[invalid="true"],QPlainTextEdit[invalid="true"]{border:1px solid #ef4444;background:#1f1118}
-QTableWidget{background:#0b1220;gridline-color:#1e293b;border:1px solid #243044;border-radius:12px;selection-background-color:#1d4ed8;alternate-background-color:#101a2e}
-QHeaderView::section{background:#111c33;color:#cbd5e1;padding:8px;border:0;border-right:1px solid #243044;font-weight:700}
-QListWidget{background:#0b1220;border:1px solid #243044;border-radius:12px;padding:6px} QListWidget::item{padding:10px;border-radius:10px} QListWidget::item:selected{background:#1d4ed8}
-QProgressBar{background:#0b1220;border:1px solid #334155;border-radius:8px;height:12px;text-align:center} QProgressBar::chunk{background:#22c55e;border-radius:7px}
-"""
-
-STATE_META = {
-    "idle": ("待命", "#64748b"),
-    "watching": ("监控中", "#22c55e"),
-    "collecting": ("处理中", "#eab308"),
-    "stopping": ("停止中", "#f97316"),
-    "error": ("异常", "#ef4444"),
-}
-
 
 class UserFacingError(ValueError):
     def __init__(self, message: str, widget: QWidget | None = None, page_index: int | None = None) -> None:
@@ -87,55 +59,6 @@ class UserFacingError(ValueError):
         self.widget = widget
         self.page_index = page_index
 
-
-class ServiceThread(QThread):
-    log_signal = Signal(str)
-    result_signal = Signal(dict)
-    progress_signal = Signal(int, int)
-    status_signal = Signal(str)
-    error_signal = Signal(str)
-    models_signal = Signal(list)
-
-    def __init__(self, settings: Settings, storage: Storage, mode: str, start_date: date | None = None, end_date: date | None = None) -> None:
-        super().__init__()
-        self.settings = settings
-        self.storage = storage
-        self.mode = mode
-        self.start_date = start_date
-        self.end_date = end_date
-        self.stop_event = threading.Event()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def run(self) -> None:
-        try:
-            svc = MonitorService(
-                self.settings,
-                storage=self.storage,
-                log_callback=lambda msg: self.log_signal.emit("INFO | " + msg),
-                result_callback=self.result_signal.emit,
-                progress_callback=self.progress_signal.emit,
-            )
-            if self.mode == "watch":
-                self.status_signal.emit("常驻监控运行中")
-                svc.watch(self.stop_event)
-                self.status_signal.emit("常驻监控已停止")
-            elif self.mode == "collect":
-                if not self.start_date or not self.end_date:
-                    raise ValueError("收集模式缺少日期范围")
-                self.status_signal.emit(f"正在收集 {self.start_date} ~ {self.end_date}")
-                svc.collect(self.start_date, self.end_date, self.stop_event)
-                self.status_signal.emit("一键收集完成")
-            elif self.mode == "models":
-                self.status_signal.emit("正在读取本地 Ollama 模型")
-                self.models_signal.emit(svc.list_models())
-                self.status_signal.emit("本地 Ollama 连接正常")
-            else:
-                raise ValueError(f"未知任务：{self.mode}")
-        except Exception as exc:
-            self.error_signal.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}")
-            self.status_signal.emit("任务异常，请查看日志")
 
 class FirstRunDialog(QDialog):
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
