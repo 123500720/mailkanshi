@@ -18,6 +18,12 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.5.0",
 ]
+notify = [
+    "plyer>=2.1.0",
+]
+build = [
+    "pyinstaller>=6.0.0",
+]
 
 [project.scripts]
 mailkanshi = "app:main"
